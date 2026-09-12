@@ -202,26 +202,71 @@ def _list_mod_names() -> List[str]:
     return _MOD_LIST_CACHE_VAL
 
 
+def _resolve_mod_file(name_or_path: str) -> Optional[str]:
+    """Resolve a RefMod widget value to a path *without* the .safetensors ext.
+
+    The loaders take a file the same way LoadImage takes an image: the widget
+    holds the uploaded filename (saved into input/), which resolves here. A
+    direct path (absolute, or relative to the ComfyUI CWD) also resolves so a
+    headless client can point straight at a file on disk. No mods-folder
+    dropdown lookup. Returns the extension-less path for ``H3RefMod.load`` /
+    ``read_refmod_meta``, or None if it doesn't resolve to a .safetensors file.
+    """
+    if not name_or_path:
+        return None
+    raw = os.path.normpath(str(name_or_path).strip().strip('"'))
+    candidates = []
+    if os.path.isabs(raw):
+        candidates.append(raw)
+    else:
+        try:
+            candidates.append(os.path.join(folder_paths.get_input_directory(), raw))
+        except Exception:
+            pass
+        candidates.append(os.path.abspath(raw))  # relative to the CWD
+    for c in candidates:
+        stem = c[:-len(".safetensors")] if c.lower().endswith(".safetensors") else c
+        if os.path.isfile(stem + ".safetensors"):
+            return stem
+    return None
+
+
 def _find_mod_path(name: str) -> str:
-    for d in _mod_search_dirs():
-        p = os.path.join(d, name)
-        if os.path.isfile(p + ".safetensors"):
-            return p
+    # Load-by-file only: the widget value is the uploaded .safetensors filename
+    # (resolved from input/, like a LoadImage filename) or a direct path. No
+    # mods-folder dropdown lookup.
+    direct = _resolve_mod_file(name)
+    if direct is not None:
+        return direct
     raise FileNotFoundError(
-        f"RefMod '{name}' not found. Searched:\n" +
-        "\n".join(f"  - {d}/{name}.safetensors" for d in _mod_search_dirs()))
+        f"RefMod file '{name}' not found. Use the node's load button to choose "
+        f"a .safetensors file (it is uploaded into input/), or pass a path to one.")
 
 
 def _load_mod(name: str) -> H3RefMod:
-    if name in _MOD_CACHE:
-        return _MOD_CACHE[name]
     mod = H3RefMod.load(_find_mod_path(name), device="cpu")
-    _MOD_CACHE[name] = mod
-    if len(_MOD_CACHE) > _MOD_CACHE_MAX:
-        # FIFO eviction: pop the oldest-loaded mod so a long session loading
-        # many different mods doesn't accumulate every one of them in RAM
-        _MOD_CACHE.pop(next(iter(_MOD_CACHE)))
     return mod
+
+
+def _is_valid_mod_ref(name_or_path: str) -> bool:
+    """True if the value resolves to a usable RefMod .safetensors file."""
+    if _is_empty_mod_slot(name_or_path):
+        return False
+    stem = _resolve_mod_file(name_or_path)
+    if stem is None:
+        return False
+    meta = read_refmod_meta(stem)
+    return meta is not None and meta.get("kind") in ("image", "video")
+
+
+def _is_empty_mod_slot(value) -> bool:
+    """True when a mod slot is unused: empty, None, whitespace, or a legacy
+    placeholder. Old workflows (and the mod2v tool) send the literal '(none)'
+    for unused loader slots, so that placeholder is treated as empty too."""
+    if value is None:
+        return True
+    s = str(value).strip()
+    return s == "" or s.lower() in ("(none)", "none", "null")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -639,17 +684,19 @@ class MiniMaxH3RefModsLoader:
     """Load 1-8 RefMods in one node, each with its own typed strength."""
 
     MAX_SLOTS = 8
-    NONE = "(none)"
+    NONE = "(none)"   # legacy placeholder sent by old workflows; treated as empty
 
     @classmethod
     def INPUT_TYPES(cls):
-        names = [cls.NONE] + _list_mod_names()
         required = {
             "show_info": ("BOOLEAN", {"default": False,
                 "tooltip": "Print full details (tokens, layout, source, pool) of every loaded mod to the console."}),
         }
         for i in range(1, cls.MAX_SLOTS + 1):
-            required[f"mod_{i}"] = (names, {"tooltip": f"RefMod {i} to load, or {cls.NONE}."})
+            required[f"mod_{i}"] = ("STRING", {"default": "",
+                "tooltip": f"RefMod {i} — click the slot's load button and choose a "
+                           f".safetensors file (uploaded into input/, exactly like "
+                           f"LoadImage). Empty = slot skipped."})
             required[f"strength_{i}"] = ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
                 "step": 0.01, "display": "number",
                 "tooltip": "How strongly this mod's reference is preserved. 1.0 = full ref (official "
@@ -672,20 +719,22 @@ class MiniMaxH3RefModsLoader:
 
     @classmethod
     def VALIDATE_INPUTS(cls, **kwargs):
-        available = set(_list_mod_names())
         for i in range(1, cls.MAX_SLOTS + 1):
-            name = str(kwargs.get(f"mod_{i}", cls.NONE))
-            if name and name != cls.NONE and name not in available:
-                return (f"RefMod slot {i}: '{name}' not found in mods/. "
-                        "Run Extract H3 RefMod first.")
+            name = kwargs.get(f"mod_{i}")
+            if _is_empty_mod_slot(name):
+                continue
+            if not _is_valid_mod_ref(name):
+                return (f"RefMod slot {i}: '{name}' is not a usable RefMod file. "
+                        "Click the slot's load button and choose a .safetensors "
+                        "file (run Extract H3 RefMod to create one).")
         return True
 
     def load(self, show_info=False, **kwargs):
         rows = []  # (mod, strength, copies)
         for i in range(1, self.MAX_SLOTS + 1):
-            name = str(kwargs.get(f"mod_{i}", self.NONE))
+            name = kwargs.get(f"mod_{i}")
             strength = float(kwargs.get(f"strength_{i}", 1.0))
-            if not name or name == self.NONE or strength <= 0.0:
+            if _is_empty_mod_slot(name) or strength <= 0.0:
                 continue
             rows.append((_load_mod(name), min(1.0, max(0.0, strength)),
                          int(kwargs.get(f"copies_{i}", 1))))
@@ -699,7 +748,7 @@ class MiniMaxH3RefModsLoader:
                 + f" ({sum(m.token_count * c for m, _, c in rows)} tokens total)")
         else:
             print("[MiniMaxH3RefModsLoader] no mods selected "
-                  "(all slots (none) or strength 0)")
+                  "(all slots empty or strength 0)")
         if show_info:
             for mod, strength, copies in rows:
                 print("\n".join(_info_lines(mod)))
@@ -727,18 +776,23 @@ class MiniMaxH3RefModsAxis:
     """
 
     MAX_SLOTS = 8
-    NONE = "(none)"
+    NONE = "(none)"   # legacy placeholder sent by old workflows; treated as empty
 
     @classmethod
     def INPUT_TYPES(cls):
-        names = [cls.NONE] + _list_mod_names()
         required = {
             "show_info": ("BOOLEAN", {"default": False,
                 "tooltip": "Print the selected A/B pairs and strengths to the console."}),
         }
         for i in range(1, cls.MAX_SLOTS + 1):
-            required[f"mod_a_{i}"] = (names, {"tooltip": f"A-side RefMod {i} (used when value_{i} is negative), or {cls.NONE}."})
-            required[f"mod_b_{i}"] = (names, {"tooltip": f"B-side RefMod {i} (used when value_{i} is positive), or {cls.NONE}."})
+            required[f"mod_a_{i}"] = ("STRING", {"default": "",
+                "tooltip": f"A-side RefMod {i} (used when value_{i} is negative) — click "
+                           f"the slot's load button and choose a .safetensors file. Empty "
+                           f"= unused."})
+            required[f"mod_b_{i}"] = ("STRING", {"default": "",
+                "tooltip": f"B-side RefMod {i} (used when value_{i} is positive) — click "
+                           f"the slot's load button and choose a .safetensors file. Empty "
+                           f"= unused."})
             required[f"value_{i}"] = ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0,
                 "step": 0.01, "display": "number",
                 "tooltip": "Signed strength: negative uses mod_a, positive uses mod_b, 0 skips the "
@@ -753,13 +807,15 @@ class MiniMaxH3RefModsAxis:
 
     @classmethod
     def VALIDATE_INPUTS(cls, **kwargs):
-        available = set(_list_mod_names())
         for i in range(1, cls.MAX_SLOTS + 1):
             for side in ("a", "b"):
-                name = str(kwargs.get(f"mod_{side}_{i}", cls.NONE))
-                if name and name != cls.NONE and name not in available:
-                    return (f"RefMod slot {i} ({side}): '{name}' not found in mods/. "
-                            "Run Extract H3 RefMod first.")
+                name = kwargs.get(f"mod_{side}_{i}")
+                if _is_empty_mod_slot(name):
+                    continue
+                if not _is_valid_mod_ref(name):
+                    return (f"RefMod slot {i} ({side}): '{name}' is not a usable "
+                            "RefMod file. Click the slot's load button and choose "
+                            "a .safetensors file.")
         return True
 
     def load(self, show_info=False, **kwargs):
@@ -769,8 +825,8 @@ class MiniMaxH3RefModsAxis:
             if abs(value) < 1e-6:
                 continue
             side = "b" if value > 0 else "a"
-            name = str(kwargs.get(f"mod_{side}_{i}", self.NONE))
-            if not name or name == self.NONE:
+            name = kwargs.get(f"mod_{side}_{i}")
+            if _is_empty_mod_slot(name):
                 continue
             loads.append((_load_mod(name), min(1.0, abs(value))))
         if loads:
@@ -778,7 +834,7 @@ class MiniMaxH3RefModsAxis:
                 f"{m.name}@{s:+.2f}" for m, s in loads)
                 + f" ({sum(m.token_count for m, _ in loads)} tokens total)")
         else:
-            print("[MiniMaxH3RefModsAxis] no rows selected (values 0 or both sides (none))")
+            print("[MiniMaxH3RefModsAxis] no rows selected (values 0 or both sides empty)")
         if show_info:
             for mod, strength in loads:
                 print("\n".join(_info_lines(mod)))
@@ -787,6 +843,132 @@ class MiniMaxH3RefModsAxis:
         if hint:
             print(f"[MiniMaxH3RefModsAxis] prompt_hint: {hint}")
         return (loads, hint)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Node: MiniMaxH3RefModSingle (chainable single-file loader)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MiniMaxH3RefModSingle:
+    """Load one RefMod .safetensors, chainable.
+
+    Same math as one row of Load H3 RefMods, split into its own node so each
+    file gets its own load button: wire the previous node's ``mods`` and
+    ``prompt_hint`` outputs into this node's inputs and the bundle accumulates
+    down the chain — the last node's outputs carry every mod and every hint,
+    ready for Apply H3 RefMod (or more chain links).  ``hint`` is free text
+    appended after this mod's own ``concept_type: description``; ``prepend``
+    is a label (typically the subject description, e.g. 'Subject 1 Anna')
+    placed before everything else in the chained hint.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mod": ("STRING", {"default": "",
+                    "tooltip": "RefMod file — click the load button and choose a .safetensors "
+                               "(uploaded into input/, exactly like LoadImage). Empty = this "
+                               "node only passes the inbound chain through (plus its hint text)."}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
+                    "step": 0.01, "display": "number",
+                    "tooltip": "How strongly this mod's reference is preserved (same math as "
+                               "the multi-slot loader). 1.0 = full ref; lower blurs it toward "
+                               "a softened copy of itself; 0 skips the mod entirely."}),
+                "copies": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1,
+                    "display": "number",
+                    "tooltip": "How many copies of this mod to inject (1 = normal, 2-3 = "
+                               "noticeably stronger reference; each copy costs its full token "
+                               "count in every DiT block)."}),
+                "hint": ("STRING", {"default": "",
+                    "tooltip": "Extra text appended to the chained prompt hint after this "
+                               "mod's own concept_type: description (e.g. 'smiling, holding "
+                               "a sword'). Empty = nothing added."}),
+                "prepend": ("STRING", {"default": "",
+                    "tooltip": "Text PREPENDED to the prompt hint, before everything else "
+                               "(this node's hint + the inbound chain hint) — use it as a "
+                               "subject label, e.g. 'Subject 1 Anna'. A single trailing space "
+                               "is added automatically if missing, so an input of 'Subject 1' "
+                               "becomes 'Subject 1 ' and the hint flows on from it. Commonly "
+                               "'<Subject n> Name' is used so each mod's hint reads as a "
+                               "labeled block in the final prompt. Empty = nothing prepended."}),
+                "show_info": ("BOOLEAN", {"default": False,
+                    "tooltip": "Print full details of this node's mod to the console."}),
+            },
+            "optional": {
+                "mods": ("H3_REF_MODS", {
+                    "tooltip": "Inbound bundle from a previous Load H3 RefMod node — this "
+                               "node's mod is appended to it."}),
+                "prompt_hint": ("STRING", {"forceInput": True,
+                    "tooltip": "Inbound prompt hint from a previous Load H3 RefMod node — "
+                               "this node's block (prepend + concept hint + appended text) "
+                               "is appended after it."}),
+            },
+        }
+
+    RETURN_TYPES = ("H3_REF_MODS", "STRING")
+    RETURN_NAMES = ("mods", "prompt_hint")
+    FUNCTION = "load"
+    CATEGORY = "MiniMax-H3/mod"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, mod="", **kwargs):
+        if _is_empty_mod_slot(mod):
+            return True
+        if not _is_valid_mod_ref(mod):
+            return (f"'{mod}' is not a usable RefMod file. Click the load button "
+                    "and choose a .safetensors file (run Extract H3 RefMod to "
+                    "create one).")
+        return True
+
+    def load(self, mod="", strength=1.0, copies=1, hint="", prepend="",
+             mods=None, prompt_hint="", show_info=False):
+        loads = list(mods) if mods else []
+        own = None
+        n = max(1, int(copies))
+        if not _is_empty_mod_slot(mod) and float(strength) > 0.0:
+            m = _load_mod(mod)
+            s = min(1.0, max(0.0, float(strength)))
+            own = (m, s)
+            loads.extend([own] * n)
+        # hint chain: the inbound chain hint stays FIRST (first node in the
+        # chain at the top of the final output), then this node's own block
+        # AFTER it.  The prepend labels THIS node's block only — it goes in
+        # front of this node's own hint text, never ahead of the inbound
+        # chain (otherwise a later node's label jumps ahead of an earlier
+        # node's block).
+        own_parts = []
+        own_hint = _prompt_hint([own]) if own is not None else ""
+        if own_hint:
+            own_parts.append(own_hint)
+        if hint and str(hint).strip():
+            own_parts.append(str(hint).strip())
+        own_block = " ".join(own_parts)
+        if prepend and str(prepend).strip():
+            pre = str(prepend).strip()
+            pre += " "  # single trailing space is automatic — 'Subject 1' -> 'Subject 1 '
+            own_block = pre + own_block if own_block else pre
+        parts = []
+        if prompt_hint and str(prompt_hint).strip():
+            parts.append(str(prompt_hint).strip())
+        if own_block:
+            parts.append(own_block)
+        combined = " ".join(parts)
+        if own is not None:
+            print(f"[MiniMaxH3RefModSingle] {own[0].name}@{own[1]:.2f}"
+                  + (f" x{n}" if n > 1 else "")
+                  + f" ({len(loads)} mod(s) in chain, "
+                    f"{sum(mm.token_count for mm, _ in loads)} tokens total)")
+        else:
+            print(f"[MiniMaxH3RefModSingle] no mod on this node — passing "
+                  f"{len(loads)} chained mod(s) through")
+        if show_info and own is not None:
+            print("\n".join(_info_lines(own[0])))
+            print(f"  {'strength':<18} {own[1]:.2f}"
+                  + (f"  (x{n} copies)" if n > 1 else ""))
+        if combined:
+            print(f"[MiniMaxH3RefModSingle] prompt_hint: {combined}")
+        return (loads, combined)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1520,6 +1702,7 @@ NODE_CLASS_MAPPINGS = {
     "MiniMaxH3RefModFolderLoader": MiniMaxH3RefModFolderLoader,
     "MiniMaxH3RefModsLoader": MiniMaxH3RefModsLoader,
     "MiniMaxH3RefModsAxis": MiniMaxH3RefModsAxis,
+    "MiniMaxH3RefModSingle": MiniMaxH3RefModSingle,
     "MiniMaxH3RefModApply": MiniMaxH3RefModApply,
     "MiniMaxH3RefModStepCurve": MiniMaxH3RefModStepCurve,
 }
@@ -1529,6 +1712,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3RefModFolderLoader": "Load H3 RefMod Folder",
     "MiniMaxH3RefModsLoader": "Load H3 RefMods",
     "MiniMaxH3RefModsAxis": "Load H3 RefMod Axis",
+    "MiniMaxH3RefModSingle": "Load H3 RefMod",
     "MiniMaxH3RefModApply": "Apply H3 RefMod",
     "MiniMaxH3RefModStepCurve": "H3 RefMod Step Curve",
 }
@@ -1558,6 +1742,79 @@ try:
 except Exception:
     # standalone/CLI contexts without a running server: migration just won't
     # be registered until ComfyUI actually loads the pack
+    pass
+
+
+# Upload endpoint for the loaders' per-slot file button. The mod slots take a
+# .safetensors the same way LoadImage takes an image: the web/js widget sends
+# the file here, it is saved into input/, and the returned filename is stored
+# in the slot (resolved from input/ at run time by _find_mod_path). No
+# mods-folder dropdown, no server-side browse — file load only.
+try:
+    from server import PromptServer
+    from aiohttp import web
+
+    @PromptServer.instance.routes.post("/minimaxh3mod/upload")
+    async def _minimaxh3mod_upload(request):
+        """Receive a .safetensors RefMod and save it into input/ for remote runs.
+
+        Mirrors ComfyUI's /upload/image flow so a headless/remote client can
+        submit a RefMod with a workflow: POST the file bytes once (multipart
+        field ``file``, like the curl example below), then reference the
+        returned bare filename in the loader's mod widget
+        (``"mod_1": "hero.safetensors"``). ``_find_mod_path`` resolves that
+        name from input/ at run time — the file is never copied into
+        models/refmods.
+
+            curl -F "file=@hero.safetensors" http://HOST:8188/minimaxh3mod/upload
+
+        A ``subfolder`` form field (optional) places it under input/<subfolder>.
+        Only .safetensors is accepted; the file must carry RefMod metadata.
+        """
+        try:
+            data = await request.post()
+        except Exception as exc:
+            return web.json_response({"error": f"could not read form data: {exc}"}, status=400)
+        upload = data.get("file")
+        if upload is None or not getattr(upload, "filename", ""):
+            return web.json_response({"error": "missing form field 'file'"}, status=400)
+        filename = os.path.basename(upload.filename)  # strip any client-supplied path
+        if not filename.lower().endswith(".safetensors"):
+            return web.json_response(
+                {"error": f"only .safetensors files are accepted (got '{filename}')"},
+                status=400)
+        subfolder = str(data.get("subfolder", "") or "").strip().strip("/\\")
+        # prevent path escape via a crafted subfolder
+        if subfolder and (".." in subfolder.split(("/", "\\")) or os.path.isabs(subfolder)):
+            subfolder = ""
+        base_dir = os.path.normpath(folder_paths.get_input_directory())
+        target_dir = base_dir
+        if subfolder:
+            target_dir = os.path.normpath(os.path.join(base_dir, subfolder))
+            if not (target_dir + os.sep).startswith(base_dir + os.sep):
+                target_dir = base_dir
+        os.makedirs(target_dir, exist_ok=True)
+        dest = os.path.join(target_dir, filename)
+        try:
+            contents = upload.file.read()
+            with open(dest, "wb") as f:
+                f.write(contents)
+        except Exception as exc:
+            return web.json_response({"error": f"could not save file: {exc}"}, status=500)
+        # must be a real RefMod, not just any safetensors — validate metadata
+        meta = read_refmod_meta(os.path.splitext(dest)[0])
+        if meta is None or meta.get("kind") not in ("image", "video"):
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            return web.json_response(
+                {"error": f"'{filename}' has no RefMod metadata — not a usable RefMod"},
+                status=400)
+        rel = os.path.join(subfolder, filename) if subfolder else filename
+        print(f"[MiniMaxH3Mod] uploaded RefMod -> {dest} ({len(contents)/1024:.0f} KB)")
+        return web.json_response({"name": rel, "path": dest, "subfolder": subfolder})
+except Exception:
     pass
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
